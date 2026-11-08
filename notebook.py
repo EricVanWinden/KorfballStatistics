@@ -7,6 +7,7 @@
 # ]
 # ///
 # %pip install -r requirements.txt
+# %restart_python
 
 # COMMAND ----------
 
@@ -25,7 +26,7 @@ schema = "korfball_statistics"
 
 def append_to_table(pdf, table_name):
     if table_name == "lineup":
-        schema = StructType(
+        table_schema = StructType(
             [
                 StructField("match_id", StringType(), False),
                 StructField("club_code", StringType(), True),
@@ -40,7 +41,7 @@ def append_to_table(pdf, table_name):
             ]
         )
     elif table_name == "events":
-        schema = StructType(
+        table_schema = StructType(
             [
                 StructField("match_id", StringType(), False),
                 StructField("Row", IntegerType(), False),
@@ -53,10 +54,11 @@ def append_to_table(pdf, table_name):
                 StructField("Result", StringType(), True),
                 StructField("HomeScore", IntegerType(), True),
                 StructField("AwayScore", IntegerType(), True),
+                StructField("Half", IntegerType(), True),
             ]
         )
     elif table_name == "matches":
-        schema = StructType(
+        table_schema = StructType(
             [
                 StructField("match_id", StringType(), False),
                 StructField("date", StringType(), True),
@@ -67,8 +69,10 @@ def append_to_table(pdf, table_name):
     else:
         raise ValueError(f"Table {table_name} not supported")
 
-    sdf = spark.createDataFrame(pdf, schema)
-    sdf.write.mode("append").saveAsTable(f"{catalog}.{schema}.{table_name}")
+    sdf = spark.createDataFrame(pdf, table_schema)
+    path = f"{catalog}.{schema}.{table_name}"
+    print(f"Saving {sdf.count()} rows to {path}")
+    sdf.write.mode("append").saveAsTable(path)
 
 # COMMAND ----------
 
@@ -109,7 +113,8 @@ def document_columns():
             "PlayerName": "The player name that did the action",
             "Result": "The result of the scoring attempt (Missed or Goal)",
             "HomeScore": "The home score after the event",
-            "AwayScore": "The away score after the event"
+            "AwayScore": "The away score after the event",
+            "Half": "The half of the match, 1 for the first half and 2 for the second half"
         },
         "matches": {
             "match_id": "The link to the match",
@@ -128,31 +133,6 @@ def drop_tables():
     tables = ["lineup", "events", "matches"]
     for table in tables:
         spark.sql(f"DROP TABLE IF EXISTS {catalog}.{schema}.{table}")
-
-# COMMAND ----------
-
-def analyze_file(file_path, output_folder):
-    m = ["", "", "", ""]
-    with open(file_path, 'r') as file:
-        print(f"analyzing {file_path}")
-        json_data = json.load(file)
-        match_id = json_data["MatchId"]
-        if "LineUp" in json_data:
-            df = analyze_lineup(json_data["LineUp"], match_id)
-            append_to_table(df,"lineup")
-
-        if "Events" in json_data:
-            df = analyze_events(json_data["Events"], match_id)
-            append_to_table(df,"events")
-
-        if "HomeTeam" in json_data and "AwayTeam" in json_data:
-            df_home = analyze_team(json_data["HomeTeam"], match_id)
-            df_away = analyze_team(json_data["AwayTeam"], match_id)
-            df = pd.concat([df_home, df_away], ignore_index=True)
-            append_to_table(df,"lineup")
-
-        m = analyze_match(json_data, match_id)
-    return m
 
 # COMMAND ----------
 
@@ -179,24 +159,44 @@ def analyze_match(match, match_id):
 # COMMAND ----------
 
 def analyze_events(events, match_id):
-    columns = ["Event", "Action", "Description", "PeriodTime", "TeamName", "PlayerName", "Result", "HomeScore",
-               "AwayScore"]
+    columns = [
+        "Event",
+        "Action",
+        "Description",
+        "PeriodTime",
+        "TeamName",
+        "PlayerName",
+        "Result",
+        "HomeScore",
+        "AwayScore",
+        "Half",
+    ]
     results = []
 
     e = 0
+    previous_period = -1
+    half = 1
     for event in events:
         e += 1
         if "Attack" in event and "Actions" in event["Attack"]:
             a = 0
             for action in event["Attack"]["Actions"]:
                 a += 1
-                results.append(analyze_action(e, a, columns, action))
+                current_action = analyze_action(e, a, columns, action)
+                current_action.append(half)
+                results.append(current_action)
 
-        results.append(analyze_event(e, columns, event))
+        current_event = analyze_event(e, columns, event)
+        current_period = float(current_event[3].replace(":", "."))
+        if current_period < (previous_period - 5.0):
+            half += 1
+        previous_period = current_period
+        current_event.append(half)
+        results.append(current_event)
 
     df = pd.DataFrame(results, columns=columns)
-    df["HomeScore"] = df["HomeScore"].astype('Int64')
-    df["AwayScore"] = df["AwayScore"].astype('Int64')
+    df["HomeScore"] = df["HomeScore"].astype("Int64")
+    df["AwayScore"] = df["AwayScore"].astype("Int64")
     df.insert(0, "Row", range(1, len(df) + 1))
     df.insert(0, "match_id", match_id)
     return df
@@ -210,6 +210,8 @@ def analyze_event(event_nr, columns, event):
             results.append(f"E{event_nr:03d}")
         elif column == "Description":
             results.append(event["Event"])
+        elif  column == "Half":
+            continue
         elif column in event:
             results.append(event[column])
         else:
@@ -227,6 +229,8 @@ def analyze_action(event_nr, action_nr, columns, action):
             results.append(f"A{action_nr:03d}")
         elif column == "Description":
             results.append(action["Action"])
+        elif  column == "Half":
+            continue
         elif column in action:
             results.append(action[column])
         else:
@@ -276,19 +280,43 @@ def analyze_player(player, columns):
 
 # COMMAND ----------
 
-# DBTITLE 1,Add error handling for Excel write error
 def refresh_data():
     drop_tables()
     data_folder = "/Volumes/workspace/korfball_statistics/data/raw"
-    output_folder = "/Volumes/workspace/korfball_statistics/data/processed"
     matches = []
     for f in os.listdir(data_folder):
         if f.endswith(".json"):
             file_path = f"{data_folder}/{f}"
-            match = analyze_file(file_path, output_folder)
-            matches.append(match)
+            with open(file_path, 'r') as file:
+                print(f"analyzing {file_path}")
+                json_data = json.load(file)
+                match_id = json_data["MatchId"]
 
-    match_file_name = f"{output_folder}/matches.csv"
+                # Check for duplicate match_id
+                if any(match_id == row[0] for row in matches):
+                    print(f"Skipping duplicate match_id {match_id} ({f})")
+                    continue
+
+                if "Events" in json_data:
+                    df = analyze_events(json_data["Events"], match_id)
+                    append_to_table(df,"events")
+                else:
+                    print(f"Skipping match without events {match_id} ({f})")
+                    continue
+
+                if "LineUp" in json_data:
+                    df = analyze_lineup(json_data["LineUp"], match_id)
+                    append_to_table(df,"lineup")
+
+                if "HomeTeam" in json_data and "AwayTeam" in json_data:
+                    df_home = analyze_team(json_data["HomeTeam"], match_id)
+                    df_away = analyze_team(json_data["AwayTeam"], match_id)
+                    df = pd.concat([df_home, df_away], ignore_index=True)
+                    append_to_table(df,"lineup")
+
+                match = analyze_match(json_data, match_id)
+                matches.append(match)
+
     df = pd.DataFrame(matches, columns=["match_id", "date", "home_team", "away_team"])
     append_to_table(df, "matches")
 
